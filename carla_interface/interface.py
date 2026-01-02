@@ -56,7 +56,21 @@ class CarlaInterface:
            # Get Blueprint Library
             bp_lib = self.world.get_blueprint_library()
             ego_bp = bp_lib.find(ego_filter)
+            ego_bp.set_attribute('role_name', 'ego_vehicle')
+            
             lead_bp = bp_lib.find(lead_filter)
+            lead_bp.set_attribute('role_name', 'lead_vehicle')
+            
+            # --- Robust Cleanup ---
+            # Search for existing actors with these role names and destroy them
+            # This handles cases where previous run didn't cleanup properly
+            print("Checking for existing actors to clean up...")
+            actor_list = self.world.get_actors()
+            for actor in actor_list:
+                if 'role_name' in actor.attributes:
+                    if actor.attributes['role_name'] in ['ego_vehicle', 'lead_vehicle']:
+                        print(f"Destroying stale actor: {actor.id}")
+                        actor.destroy()
             
             # 1. Select a spawn point
             # We want a road, preferably straight.
@@ -72,52 +86,60 @@ class CarlaInterface:
             ego_spawn_point = None
             lead_spawn_point = None
             
-            # Simple search for a valid pair
-            for i in range(len(spawn_points)):
+            spawn_points = self.world.get_map().get_spawn_points()
+            if not spawn_points:
+                raise ValueError("No spawn points found.")
+            
+            spawn_success = False
+            
+            # Helper to calculate lead position
+            import math
+            
+            # Check a few points (e.g., first 5 or 10) to avoid infinite wait if map is full
+            # Randomize start index to avoid stuck on same bad point? Or just iterate.
+            # Let's iterate.
+            for i in range(min(10, len(spawn_points))):
                  sp = spawn_points[i]
-                 
-                 # Calculate where lead vehicle would be
-                 # Simple approximation: move 'lead_distance' forward along yaw
-                 import math
-                 yaw_rad = math.radians(sp.rotation.yaw)
-                 lx = sp.location.x + lead_distance * math.cos(yaw_rad)
-                 ly = sp.location.y + lead_distance * math.sin(yaw_rad)
-                 lz = sp.location.z + 0.5 # slightly up
-                 
-                 # Check if this point is drivable is hard without map query, 
-                 # but we can try to spawn and see if it collides.
-                 # Better approach for simplicity: Just assume the road is straight enough at spawn point 0.
-                 # Or use specific points if we knew the map (Town04, etc).
-                 # Let's stick to the previous simple arithmetic logic but applied to the object.
                  
                  ego_spawn_point = sp
                  
-                 # Create a transform for lead vehicle
+                 # Calculate lead position
+                 yaw_rad = math.radians(sp.rotation.yaw)
+                 lx = sp.location.x + lead_distance * math.cos(yaw_rad)
+                 ly = sp.location.y + lead_distance * math.sin(yaw_rad)
+                 lz = sp.location.z + 0.5 
+                 
                  lead_loc = carla.Location(x=lx, y=ly, z=lz)
                  lead_spawn_point = carla.Transform(lead_loc, sp.rotation)
                  
-                 # In a real rigorous setup we would check waypoint connectivity.
-                 break
+                 try:
+                     print(f"Attempting spawn at index {i}...")
+                     self.vehicle = self.world.spawn_actor(ego_bp, ego_spawn_point)
+                     self.lead_vehicle = self.world.spawn_actor(lead_bp, lead_spawn_point)
+                     spawn_success = True
+                     print(f"Spawn successful at {ego_spawn_point.location}")
+                     break
+                 except Exception as e:
+                     print(f"Spawn failed at index {i} ({e}). Retrying...")
+                     if self.vehicle: 
+                         self.vehicle.destroy()
+                         self.vehicle = None
+                     if self.lead_vehicle: 
+                         self.lead_vehicle.destroy()
+                         self.lead_vehicle = None
+                     continue
+
+            if not spawn_success:
+                 raise RuntimeError("Failed to spawn vehicles after multiple attempts (Collision or Invalid Location).")
             
-            if not ego_spawn_point:
-                raise ValueError("Could not find suitable spawn point.")
-                
-            # 2. Spawn Ego Vehicle
-            print(f"Spawning Ego Vehicle at {ego_spawn_point.location}...")
-            self.vehicle = self.world.spawn_actor(ego_bp, ego_spawn_point)
-            
-            # 3. Spawn Lead Vehicle
-            print(f"Spawning Lead Vehicle at {lead_spawn_point.location}...")
-            self.lead_vehicle = self.world.spawn_actor(lead_bp, lead_spawn_point)
-            
-            # Set Autopilot for both using the explicit TM instance
-            self.vehicle.set_autopilot(True, self.tm_port)
+            # Set Autopilot ONLY for Lead Vehicle
+            self.vehicle.set_autopilot(False, self.tm_port) # Ensure Ego is manual
             self.lead_vehicle.set_autopilot(True, self.tm_port)
             
             # NOTE: For even more determinism (e.g. forced collision), we could set velocity vectors directly.
             # But autopilot is good for "traffic flow" scenario.
             
-            print("Scenario Setup Complete: Ego and Lead vehicle spawned.")
+            print("Scenario Setup Complete: Ego (Manual) and Lead (Autopilot) vehicles spawned.")
             
         except Exception as e:
             print(f"Failed to setup scenario: {e}")
@@ -216,4 +238,52 @@ class CarlaInterface:
             'distance': round(distance, 2),
             'speed': round(relative_speed, 2)
         }
+
+    def apply_control(self, action):
+        """
+        Applies longitudinal control (throttle/brake) based on the action string.
+        Disables autopilot if intervention is needed.
+        
+        Args:
+            action (str): One of ['Maintain Speed', 'Warning Only', 'Apply Braking', 'Apply Full Braking']
+        """
+        if not self.vehicle:
+            return
+
+        control = carla.VehicleControl()
+        # Default: no steering, no reverse
+        control.steer = 0.0
+        control.hand_brake = False
+        control.manual_gear_shift = False
+
+        # Always disable Autopilot to ensure Manual Control
+        self.vehicle.set_autopilot(False, self.tm_port)
+
+        if action == "Maintain Speed" or action == "Warning Only":
+            # Apply constant low throttle to move forward (Initial Motion)
+            control.throttle = 0.3 
+            control.brake = 0.0
+            
+        elif action == "Apply Braking":
+            control.throttle = 0.0
+            control.brake = 0.5 # Moderate braking
+            
+        elif action == "Apply Full Braking":
+            # Should be covered by latch, but for completeness
+            control.throttle = 0.0
+            control.brake = 1.0 # Full emergency braking
+            
+        else:
+            # Fallback
+            control.throttle = 0.0
+            control.brake = 0.0
+
+        self.vehicle.apply_control(control)
+
+    def get_ego_speed(self):
+        """Returns the current speed of the ego vehicle in m/s."""
+        if not self.vehicle:
+            return 0.0
+        vel = self.vehicle.get_velocity()
+        return (vel.x**2 + vel.y**2 + vel.z**2)**0.5
 

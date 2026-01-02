@@ -5,11 +5,13 @@ from perception_agent.agent import PerceptionAgent
 from distance_agent.agent import DistanceEstimationAgent
 from decision_agent.agent import DecisionAgent
 from alert_agent.agent import AlertAgent
+from collision_avoidance_agent.agent import CollisionAvoidanceAgent
 from explainable_ai.xai import XAIModule
 from carla_interface.interface import CarlaInterface
 import argparse
 import sys
 import datetime
+import time
 
 def main():
     """
@@ -37,27 +39,28 @@ def main():
     distance_estimator = DistanceEstimationAgent()
     decision_maker = DecisionAgent(fps=10) # Default FPS, updated in specific modes
     alerter = AlertAgent()
+    collision_avoider = CollisionAvoidanceAgent()
     explainer = XAIModule()
     
     # 3. Mode Dispatch
     if args.source == 'carla':
         print("\n--- Starting CARLA Simulation Mode ---")
-        run_carla_mode(perception, distance_estimator, decision_maker, alerter, explainer, args.output_path)
+        run_carla_mode(perception, distance_estimator, decision_maker, alerter, collision_avoider, explainer, args.output_path)
         
     elif args.source == 'dataset':
         print("\n--- Starting Dataset Evaluation Mode ---")
-        run_dataset_mode(args.data_path, perception, distance_estimator, decision_maker, alerter, explainer, args.output_path)
+        run_dataset_mode(args.data_path, perception, distance_estimator, decision_maker, alerter, collision_avoider, explainer, args.output_path)
         
     elif args.source == 'video':
         print("\n--- Starting Video Processing Mode ---")
         # Check for video file
         video_files = glob.glob(os.path.join(args.data_path, '*.mp4'))
         if video_files:
-             run_video_mode(video_files[0], perception, distance_estimator, decision_maker, alerter, explainer, args.output_path)
+             run_video_mode(video_files[0], perception, distance_estimator, decision_maker, alerter, collision_avoider, explainer, args.output_path)
         else:
             print(f"No video files found in {args.data_path}")
 
-def run_dataset_mode(data_path, perception, distance_estimator, decision_maker, alerter, explainer, output_path):
+def run_dataset_mode(data_path, perception, distance_estimator, decision_maker, alerter, collision_avoider, explainer, output_path):
     """
     Runs the FCW pipeline on a dataset of images (e.g., BDD100K).
     """
@@ -92,11 +95,15 @@ def run_dataset_mode(data_path, perception, distance_estimator, decision_maker, 
         
         # 4. Alert
         alert_msg = alerter.generate_alert(overall_status, detections)
+        
+        # 5. Collision Avoidance (Disabled in Dataset Mode)
+        action = "Maintain Speed"
+            
         if alert_msg:
             print(f"  [ALERT] {alert_msg}")
             
-        # 5. XAI
-        annotated_frame, explanation = explainer.explain(frame, detections, alert_msg)
+        # 6. XAI
+        annotated_frame, explanation = explainer.explain(frame, detections, alert_msg, action)
         
         # Save output
         base_name = os.path.basename(img_path)
@@ -109,7 +116,7 @@ def run_dataset_mode(data_path, perception, distance_estimator, decision_maker, 
 
     print("Dataset processing complete.")
 
-def run_carla_mode(perception, distance_estimator, decision_maker, alerter, explainer, output_path):
+def run_carla_mode(perception, distance_estimator, decision_maker, alerter, collision_avoider, explainer, output_path):
     """
     Runs the FCW pipeline connected to the CARLA simulator.
     Handles:
@@ -127,8 +134,10 @@ def run_carla_mode(perception, distance_estimator, decision_maker, alerter, expl
         carla_interface.attach_camera()
         
         # Wait for simulation to settle
-        import time
         time.sleep(2)
+        
+        # Reset Agent State for new run
+        collision_avoider.reset()
         
         print("Processing CARLA stream. Press Ctrl+C to stop.")
         
@@ -144,6 +153,7 @@ def run_carla_mode(perception, distance_estimator, decision_maker, alerter, expl
         out = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
         
         frame_idx = 0
+        stop_snapshot_saved = False
         while True:
             frame = carla_interface.get_frame()
             if frame is None:
@@ -170,12 +180,32 @@ def run_carla_mode(perception, distance_estimator, decision_maker, alerter, expl
             # 4. Alert
             alert_msg = alerter.generate_alert(overall_status, detections)
             
+            # 5. Collision Avoidance
+            ego_speed = carla_interface.get_ego_speed()
+            action = collision_avoider.get_control_action(detections, overall_status, ego_speed)
+            if action != "Maintain Speed":
+                print(f"  [CONTROL] {action}")
+            
+            # Apply Control to CARLA
+            carla_interface.apply_control(action)
+
+            # Check for Emergency Stop Event
+            # ego_speed already retrieved
+            # Check for Emergency Stop Event
+            # ego_speed already retrieved
+            if action == "Apply Full Braking" and ego_speed < 0.1 and not stop_snapshot_saved:
+                print("  [EVENT] Ego Vehicle Stopped. Saving Explanation.")
+                # Force an explanation generation if not already done
+                annotated_frame, explanation = explainer.explain(frame, detections, alert_msg, action, ego_speed, collision_avoider.emergency_latch)
+                _save_alert_snapshot(annotated_frame, explanation, "EMERGENCY STOP EXECUTED", output_path)
+                stop_snapshot_saved = True
+
             if alert_msg:
                 print(f"  [ALERT] {alert_msg}")
-                _log_carla_event(detections, output_path)
+                _log_carla_event(detections, output_path, action, collision_avoider.emergency_latch)
             
-            # 5. XAI
-            annotated_frame, explanation = explainer.explain(frame, detections, alert_msg)
+            # 6. XAI
+            annotated_frame, explanation = explainer.explain(frame, detections, alert_msg, action, ego_speed, collision_avoider.emergency_latch)
             
             if alert_msg:
                 _save_alert_snapshot(annotated_frame, explanation, alert_msg, output_path)
@@ -201,7 +231,7 @@ def run_carla_mode(perception, distance_estimator, decision_maker, alerter, expl
             out.release()
         cv2.destroyAllWindows()
 
-def run_video_mode(video_path, perception, distance_estimator, decision_maker, alerter, explainer, output_path):
+def run_video_mode(video_path, perception, distance_estimator, decision_maker, alerter, collision_avoider, explainer, output_path):
     """
     Runs the pipeline on a video file.
     """
@@ -224,7 +254,11 @@ def run_video_mode(video_path, perception, distance_estimator, decision_maker, a
         detections = distance_estimator.estimate(detections, frame.shape[1])
         detections, overall_status = decision_maker.analyze(detections)
         alert_msg = alerter.generate_alert(overall_status, detections)
-        annotated_frame, explanation = explainer.explain(frame, detections, alert_msg)
+        
+        # Collision Avoidance disabled in Video Mode
+        action = "Maintain Speed"
+            
+        annotated_frame, explanation = explainer.explain(frame, detections, alert_msg, action)
         
         out.write(annotated_frame)
             
@@ -232,11 +266,19 @@ def run_video_mode(video_path, perception, distance_estimator, decision_maker, a
     out.release()
     print("Video processing complete.")
 
-def _log_carla_event(detections, output_path):
+def _log_carla_event(detections, output_path, action="Maintain Speed", latch_state=False):
     """Helper to log CARLA events to CSV."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Determine Brake Intensity
+    brake_intensity = 0.0
+    if action == "Apply Braking":
+        brake_intensity = 0.5
+    elif action == "Apply Full Braking":
+        brake_intensity = 1.0
+        
     for det in detections:
-        # Log relevant detections
+        # Log relevant detections (Unsafe or if we are taking action)
         if det.get('risk') == 'Unsafe' or 'ground_truth' in det:
              dist = det.get('distance', -1)
              speed = det.get('speed', -1)
@@ -245,12 +287,12 @@ def _log_carla_event(detections, output_path):
              gt_speed = det.get('gt_speed', -1)
              gt_ttc = det.get('gt_ttc', -1)
              
-             log_line = f"{timestamp},{dist},{speed},{ttc},{gt_dist},{gt_speed},{gt_ttc}\n"
+             log_line = f"{timestamp},{dist},{speed},{ttc},{gt_dist},{gt_speed},{gt_ttc},{action},{brake_intensity},{latch_state}\n"
              
              csv_path = os.path.join(output_path, "carla_events.csv")
              if not os.path.exists(csv_path):
                  with open(csv_path, 'w') as f:
-                     f.write("Timestamp,Distance,Speed,TTC,GT_Distance,GT_Speed,GT_TTC\n")
+                     f.write("Timestamp,Distance,Speed,TTC,GT_Distance,GT_Speed,GT_TTC,Action,Brake_Intensity,Latch_Active\n")
              
              with open(csv_path, 'a') as f:
                  f.write(log_line)
