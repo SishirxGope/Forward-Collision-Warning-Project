@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
+import traceback
 
 class XAIModule:
-    def __init__(self):
-        pass
+    def __init__(self, monocular_agent=None):
+        self.monocular_agent = monocular_agent
         
     def explain(self, frame, detections, alert_message, control_action="Maintain Speed", ego_speed=0.0, latch_state=False):
         """
@@ -22,90 +23,107 @@ class XAIModule:
             str: Detailed text explanation.
         """
         explained_frame = frame.copy()
-        text_log = []
+        try:
+            # print("[DEBUG] XAI: Copying frame", flush=True)
+            height, width = explained_frame.shape[:2]
+            text_log = []
         
-        # Identify critical object for control explanation
-        critical_det = None
-        min_ttc = float('inf')
-        
-        # Generate Saliency Map (Simulated as Heatmap on risky objects)
-        # In a full research project, this would use GradCAM.
-        # Here we verify the claim by highlighting the region of interest effectively.
-        saliency_layer = np.zeros_like(explained_frame, dtype=np.uint8)
-        
-        for det in detections:
-            x1, y1, x2, y2 = det['box']
-            label = det['label']
-            dist = det['distance']
-            risk = det.get('risk', 'Safe')
-            ttc = det.get('ttc', float('inf'))
-            speed = det.get('speed', 0)
-
-            # Color coding
-            if risk == 'Unsafe':
-                color = (0, 0, 255) # Red
-                # Add check to saliency
-                cv2.rectangle(saliency_layer, (x1, y1), (x2, y2), (0, 0, 255), -1)
-                explanation = f"CRITICAL: {label} is {dist}m away, approaching at {speed}m/s. TTC {ttc}s < Threshold."
-                
-                # Check if this is the most critical for control
-                # Prioritize GT
-                eff_ttc = det.get('gt_ttc', ttc)
-                if eff_ttc < min_ttc and eff_ttc > 0:
-                    min_ttc = eff_ttc
-                    critical_det = det
-            else:
-                color = (0, 255, 0) # Green
-                explanation = f"Safe: {label} at {dist}m."
+            # Identify critical object for control explanation
+            critical_det = None
+            min_ttc = float('inf')
             
-            text_log.append(explanation)
-
-            # Draw Box
-            cv2.rectangle(explained_frame, (x1, y1), (x2, y2), color, 2)
+            # Generate Saliency Map (Simulated as Heatmap on risky objects)
+            # Implemented with simple rectangles for efficiency
+            saliency_layer = np.zeros_like(explained_frame, dtype=np.uint8)
             
-            # Label
-            label_text = f"{label} {dist}m"
-            if risk == 'Unsafe':
-                label_text += f" TTC:{ttc}s"
+            for det in detections:
+                x1, y1, x2, y2 = det['box']
+                # Sanitize coordinates
+                x1 = int(max(0, min(x1, width - 1)))
+                y1 = int(max(0, min(y1, height - 1)))
+                x2 = int(max(0, min(x2, width - 1)))
+                y2 = int(max(0, min(y2, height - 1)))
                 
-            cv2.putText(explained_frame, label_text, (x1, y1 - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                label = det['label']
+                dist = det['distance']
+                risk = det.get('risk', 'Safe')
+                ttc = det.get('ttc', float('inf'))
+                speed = det.get('speed', 0)
 
-        # Control Explanation
-        if control_action in ["Apply Braking", "Apply Full Braking"]:
-             brake_intensity = 0.5 if control_action == "Apply Braking" else 1.0
-             
-             control_exp = f"\n[CONTROL ACTION]: {control_action}\n" \
-                           f"  - Brake Intensity: {brake_intensity:.1f}\n" \
-                           f"  - Ego Speed: {ego_speed:.2f} m/s\n" \
-                           f"  - Latch Active: {latch_state}"
-             
-             if critical_det:
-                 c_label = critical_det['label']
-                 c_dist = critical_det['distance']
-                 c_ttc = critical_det.get('gt_ttc', critical_det.get('ttc'))
-                 c_risk = critical_det.get('risk')
-                 control_exp += f"\n  - Reason: High Collision Risk with {c_label}\n" \
-                                f"  - Distance: {c_dist}m\n" \
-                                f"  - TTC: {c_ttc}s\n" \
-                                f"  - Risk Assessment: {c_risk}"
-             elif latch_state:
-                 control_exp += "\n  - Reason: Emergency Latch Active (Override)"
+                # Color coding
+                if risk == 'Unsafe':
+                    color = (0, 0, 255) # Red
+                    # Add check to saliency
+                    cv2.rectangle(saliency_layer, (x1, y1), (x2, y2), (0, 0, 255), -1)
+                    explanation = f"CRITICAL: {label} is {dist}m away, approaching at {speed}m/s. TTC {ttc}s < Threshold."
+                    
+                    # Check if this is the most critical for control
+                    # Prioritize GT
+                    eff_ttc = det.get('gt_ttc', ttc)
+                    if eff_ttc < min_ttc and eff_ttc > 0:
+                        min_ttc = eff_ttc
+                        critical_det = det
+                else:
+                    color = (0, 255, 0) # Green
+                    explanation = f"Safe: {label} at {dist}m."
+                
+                text_log.append(explanation)
+
+                # Draw Box
+                cv2.rectangle(explained_frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw 3D Box if available AND renderer exists
+                if 'box_3d' in det and det['box_3d'] is not None and self.monocular_agent:
+                    explained_frame = self.monocular_agent.draw_3d_box(explained_frame, det['box_3d'], color=color, thickness=2)
+                
+                # Label
+                label_text = f"{label} {dist}m"
+                if risk == 'Unsafe':
+                    label_text += f" TTC:{ttc}s"
+                    
+                cv2.putText(explained_frame, label_text, (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            # Control Explanation
+            if control_action in ["Apply Braking", "Apply Full Braking"]:
+                 brake_intensity = 0.5 if control_action == "Apply Braking" else 1.0
                  
-             text_log.append(control_exp)
-             
-             # Draw Control Action on Screen
-             cv2.putText(explained_frame, f"ACTION: {control_action}", (50, 80), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                 control_exp = f"\n[CONTROL ACTION]: {control_action}\n" \
+                               f"  - Brake Intensity: {brake_intensity:.1f}\n" \
+                               f"  - Ego Speed: {ego_speed:.2f} m/s\n" \
+                               f"  - Latch Active: {latch_state}"
+                 
+                 if critical_det:
+                     c_label = critical_det['label']
+                     c_dist = critical_det['distance']
+                     c_ttc = critical_det.get('gt_ttc', critical_det.get('ttc'))
+                     c_risk = critical_det.get('risk')
+                     control_exp += f"\n  - Reason: High Collision Risk with {c_label}\n" \
+                                    f"  - Distance: {c_dist}m\n" \
+                                    f"  - TTC: {c_ttc}s\n" \
+                                    f"  - Risk Assessment: {c_risk}"
+                 elif latch_state:
+                     control_exp += "\n  - Reason: Emergency Latch Active (Override)"
+                     
+                 text_log.append(control_exp)
+                 
+                 # Draw Control Action on Screen
+                 cv2.putText(explained_frame, f"ACTION: {control_action}", (50, 80), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-        # Blend saliency
-        if alert_message:
-            alpha = 0.3
-            cv2.addWeighted(saliency_layer, alpha, explained_frame, 1 - alpha, 0, explained_frame)
+            # Blend saliency
+            if alert_message:
+                alpha = 0.3
+                cv2.addWeighted(saliency_layer, alpha, explained_frame, 1 - alpha, 0, explained_frame)
+                
+                # Add Alert Banner
+                cv2.rectangle(explained_frame, (0, 0), (explained_frame.shape[1], 50), (0, 0, 255), -1)
+                cv2.putText(explained_frame, alert_message, (50, 35), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             
-            # Add Alert Banner
-            cv2.rectangle(explained_frame, (0, 0), (explained_frame.shape[1], 50), (0, 0, 255), -1)
-            cv2.putText(explained_frame, alert_message, (50, 35), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            return explained_frame, "\n".join(text_log)
             
-        return explained_frame, "\n".join(text_log)
+        except Exception as e:
+            print(f"[ERROR] XAI Module Failed: {e}", flush=True)
+            traceback.print_exc()
+            return frame, "XAI Error"

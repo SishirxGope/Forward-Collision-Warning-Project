@@ -64,7 +64,12 @@ class DecisionAgent:
                         det['risk'] = 'Unsafe'
                         overall_status = "Unsafe"
                 else:
-                    det['ttc'] = float('inf')
+                     det['ttc'] = float('inf')
+
+                # Proximity Override (Vision)
+                if curr_dist < 7.0:
+                    det['risk'] = 'Unsafe'
+                    overall_status = "Unsafe"
             
             # Ground Truth Analysis
             if 'ground_truth' in det:
@@ -72,12 +77,23 @@ class DecisionAgent:
                 det['gt_dist'] = gt['distance']
                 det['gt_speed'] = gt['speed']
                 
-                if gt['speed'] > 0 and gt['distance'] > 0:
-                     gt_ttc = round(gt['distance'] / gt['speed'], 2)
+                # Use GT speed directly if available, otherwise fallback to derivative speed
+                approaching_speed = det.get('gt_speed', det.get('speed', 0.0))
+                # Update the main speed field to reflect this (for visualization/alerting)
+                det['speed'] = approaching_speed
+                
+                if approaching_speed > 0 and gt['distance'] > 0:
+                     gt_ttc = round(gt['distance'] / approaching_speed, 2)
                      det['gt_ttc'] = gt_ttc
+                     # Also update main TTC
+                     det['ttc'] = gt_ttc
                      
                      # Override risk with Ground Truth if available
                      if gt_ttc < self.ttc_threshold:
+                         det['risk'] = 'Unsafe'
+                         overall_status = "Unsafe"
+                     # Proximity Override (GT)
+                     elif gt['distance'] < 7.0:
                          det['risk'] = 'Unsafe'
                          overall_status = "Unsafe"
                      # If GT says safe but Vision says Unsafe? 

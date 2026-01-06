@@ -134,7 +134,13 @@ class CarlaInterface:
             
             # Set Autopilot ONLY for Lead Vehicle
             self.vehicle.set_autopilot(False, self.tm_port) # Ensure Ego is manual
-            self.lead_vehicle.set_autopilot(True, self.tm_port)
+            self.lead_vehicle.set_autopilot(False, self.tm_port) # Stop lead vehicle for braking test
+            
+            # Apply brakes to lead vehicle to ensure it stays put
+            control_lead = carla.VehicleControl()
+            control_lead.brake = 1.0
+            control_lead.hand_brake = True
+            self.lead_vehicle.apply_control(control_lead)
             
             # NOTE: For even more determinism (e.g. forced collision), we could set velocity vectors directly.
             # But autopilot is good for "traffic flow" scenario.
@@ -166,12 +172,15 @@ class CarlaInterface:
 
     def process_image(self, image):
         """Callback for camera sensor to put images in the queue."""
-        # Convert raw CARLA image to numpy array for OpenCV
-        i = np.array(image.raw_data)
-        i2 = i.reshape((image.height, image.width, 4))
-        # CARLA images are BGRA, opencv needs BGR
-        i3 = i2[:, :, :3] 
-        self.image_queue.put(i3)
+        try:
+            # Convert raw CARLA image to numpy array for OpenCV
+            i = np.array(image.raw_data)
+            i2 = i.reshape((image.height, image.width, 4))
+            # CARLA images are BGRA, opencv needs BGR
+            i3 = i2[:, :, :3] 
+            self.image_queue.put(i3)
+        except Exception as e:
+            print(f"Error in process_image: {e}", flush=True)
 
     def get_frame(self, timeout=1.0):
         """Retrieve the latest frame from the queue."""
@@ -215,11 +224,11 @@ class CarlaInterface:
         # Euclidean distance
         distance = loc_lead.distance(loc_ego)
         
-        # Account for vehicle length roughly (center to center vs bumper to bumper)
-        # Model 3 length ~4.7m, Nissan Patrol ~5.1m. Center to center distance includes half lengths.
-        # We want bumper-to-bumper.
-        # Approx deduction: (4.7/2) + (5.1/2) = 2.35 + 2.55 = 4.9m
-        distance = max(0.0, distance - 4.9)
+        # Euclidean distance between transform locations (Center-to-Center)
+        distance = loc_lead.distance(loc_ego)
+        
+        # User requested pure Euclidean distance between transform locations.
+        # Removed bumper-to-bumper adjustment (-4.9m).
         
         # Velocity (m/s)
         vel_ego = self.vehicle.get_velocity()
@@ -257,7 +266,10 @@ class CarlaInterface:
         control.manual_gear_shift = False
 
         # Always disable Autopilot to ensure Manual Control
-        self.vehicle.set_autopilot(False, self.tm_port)
+        try:
+            self.vehicle.set_autopilot(False, self.tm_port)
+        except Exception:
+            pass # Ignore TM errors, control override will handle it
 
         if action == "Maintain Speed" or action == "Warning Only":
             # Apply constant low throttle to move forward (Initial Motion)
@@ -266,17 +278,22 @@ class CarlaInterface:
             
         elif action == "Apply Braking":
             control.throttle = 0.0
-            control.brake = 0.5 # Moderate braking
+            control.brake = 1.0 # Increased from 0.5 to 1.0 for stronger response
             
         elif action == "Apply Full Braking":
             # Should be covered by latch, but for completeness
             control.throttle = 0.0
             control.brake = 1.0 # Full emergency braking
+            control.hand_brake = True # Force stop
             
         else:
             # Fallback
             control.throttle = 0.0
             control.brake = 0.0
+
+            control.brake = 0.0
+            
+        print(f"[DEBUG] Applying Control: {action} | Throttle: {control.throttle} | Brake: {control.brake} | Handbrake: {control.hand_brake}", flush=True)
 
         self.vehicle.apply_control(control)
 

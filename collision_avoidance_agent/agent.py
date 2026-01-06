@@ -20,10 +20,12 @@ class CollisionAvoidanceAgent:
             self.thresholds = thresholds
         
         self.emergency_latch = False # Latch for emergency braking
+        self.state = "NORMAL" # States: NORMAL, STOP
 
     def reset(self):
         """Resets the agent state (e.g., clears emergency latch)."""
         self.emergency_latch = False
+        self.state = "NORMAL"
 
     def get_control_action(self, detections, overall_status, ego_speed=0.0):
         """
@@ -46,11 +48,18 @@ class CollisionAvoidanceAgent:
         Returns:
             str: Action description for control system.
         """
-        # 0. Check Latch
+        # 0. Check Terminal State & Latch
+        if getattr(self, 'state', 'NORMAL') == "STOP":
+            return "Apply Full Braking"
+
         if self.emergency_latch:
+             # Check for transition to Terminal STOP
+            if ego_speed < 0.1: # Stopped after emergency braking
+                self.state = "STOP"
             return "Apply Full Braking"
 
         min_ttc = float('inf')
+        min_dist = float('inf')
         
         # 1. Identify the most critical TTC
         for det in detections:
@@ -64,9 +73,20 @@ class CollisionAvoidanceAgent:
             if ttc != float('inf') and ttc > 0:
                  if ttc < min_ttc:
                      min_ttc = ttc
+            
+            # Track minimum distance
+            dist = det.get('gt_dist', det.get('distance', float('inf')))
+            if dist < min_dist:
+                min_dist = dist
+                
+            # print(f"[DEBUG] CA checking: Risk={det.get('risk')} TTC={ttc} MinTTC={min_ttc}", flush=True)
         
         # 2. Apply Deterministic Logic
         action = "Maintain Speed"
+        
+        # print(f"[DEBUG] CA Decision: MinTTC={min_ttc} Warning={self.thresholds['warning']} Critical={self.thresholds['critical']}", flush=True)
+        
+        print(f"[DEBUG] CA Decision: MinTTC={min_ttc} Warning={self.thresholds['warning']} Critical={self.thresholds['critical']}", flush=True)
         
         if min_ttc == float('inf'):
             action = "Maintain Speed"
@@ -79,5 +99,25 @@ class CollisionAvoidanceAgent:
         else:
             action = "Apply Full Braking"
             self.emergency_latch = True # Trigger Latch
+            
+        # 3. Collision / Near-Collision Override
+        # If distance is extremely small (< 2.0m), assume collision or imminent impact
+        if min_dist < 2.0:
+            action = "Apply Full Braking"
+            self.emergency_latch = True
+            
+        # 4. Proximity Safety Curtain (Anti-Oscillation)
+        # Force braking if within safety distance, even if TTC is technically "safe" (e.g. slow approach)
+        # or just "Warning" level.
+        if min_dist < 7.0: # User requested 7m override
+             action = "Apply Full Braking" # Be aggressive at 7m
+             self.emergency_latch = True # Latch it to ensure we stop
+        elif min_dist < 12.0 and action in ["Maintain Speed", "Warning Only"]:
+             action = "Apply Braking" # Force braking if close
+            
+        # Check if we should transition to STOP state (any braking stop)
+        if action in ["Apply Braking", "Apply Full Braking"] and ego_speed < 0.1:
+            self.state = "STOP"
+            action = "Apply Full Braking" # Enforce full stop
             
         return action
