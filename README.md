@@ -33,6 +33,18 @@ Processes a video file for demonstration purposes.
 python main.py --source video --data_path data/
 ```
 
+### 4. Interactive GUI Mode
+Launches a PyQt5-based graphical interface for the CARLA simulation. This mode provides:
+*   **Live Camera Feed**: Real-time visualization of the ego vehicle's perspective with bounding boxes.
+*   **Radar Dashboard**: Displays numeric Distance, Relative Speed, and Time-To-Collision (TTC).
+*   **Radar Map**: A top-down 2D visualization of obstacles relative to the ego vehicle.
+*   **System Status**: Clear "SAFE", "WARNING", or "STOP" indicators with active control actions.
+
+```bash
+python gui.py
+```
+*Note: Requires a running CARLA simulator instance.*
+
 ## CARLA Simulation Validation
 To validate the efficacy and accuracy of the Forward Collision Warning system, we integrate the **CARLA Simulator** as a high-fidelity virtual test environment. This setup allows for quantitative performance analysis against absolute ground truth, which is difficult to obtain in real-world drive testing.
 
@@ -45,6 +57,11 @@ A significant advantage of simulation-based validation is the availability of pe
 *   **Time-To-Collision (TTC) Accuracy**: By retrieving the exact velocity vectors of both vehicles, we compute the ground truth TTC. The **Decision Agent** utilizes this GT data to trigger warnings, ensuring that the system's "Unsafe" alerts are physically justified.
 *   **Analysis**: Discrepancies between the vision-based estimates and the physics-based ground truth are logged to `outputs/carla_events.csv`, facilitating granular error analysis and system tuning.
 *   **Strict Enforcement**: In CARLA mode, the system *overrides* vision-based inputs with Ground Truth data for decision-making. This ensures that the collision avoidance logic is validated against the best possible data, isolating decision logic faults from perception errors.
+
+### Radar Sensor Fusion & Visualization
+The system now integrates a Radar sensor within CARLA to enhance reliability:
+*   **Sensor Fusion**: Fuses Visual detections with Radar depth and velocity data. It ensures obstacles are tracked even if visual occlusion occurs ("Ghost Objects").
+*   **Visualization**: The `gui.py` interface renders a top-down Radar Map, scaling obstacles based on their real-time distance and ensuring they are visually distinct from the ego vehicle icon.
 
 ## Collision Avoidance Extension (Automatic Braking)
 To move beyond passive warnings, the system has been extended with a **Collision Avoidance Agent** capable of active vehicle control within the CARLA simulation environment. This module transforms the system from a passive ADAS (Advanced Driver Assistance System) to an active safety system.

@@ -8,3 +8,4 @@ torch
 torchvision
 grad-cam
 carla
+PyQt5
