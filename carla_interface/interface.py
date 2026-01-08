@@ -15,7 +15,9 @@ class CarlaInterface:
         self.vehicle = None
         self.lead_vehicle = None # Track lead vehicle
         self.camera = None
+        self.radar = None
         self.image_queue = Queue()
+        self.radar_queue = Queue()
         
     def setup(self):
         """Connect to CARLA and setup the world."""
@@ -182,6 +184,85 @@ class CarlaInterface:
         except Exception as e:
             print(f"Error in process_image: {e}", flush=True)
 
+    def attach_radar(self, range=50.0, h_fov=35.0, v_fov=5.0):
+        """Attaches a Radar sensor to the ego vehicle."""
+        if not self.vehicle:
+            raise ValueError("Vehicle not spawned. Call spawn_ego_vehicle() first.")
+            
+        bp_lib = self.world.get_blueprint_library()
+        radar_bp = bp_lib.find('sensor.other.radar')
+        radar_bp.set_attribute('horizontal_fov', str(h_fov))
+        radar_bp.set_attribute('vertical_fov', str(v_fov))
+        radar_bp.set_attribute('range', str(range))
+        
+        # Position the radar on the front bumper (approx x=2.3, z=0.5 for Model 3)
+        # UPDATED: Move forward and up to avoid self-collision/ground hits (x=2.8, z=1.0)
+        spawn_point = carla.Transform(carla.Location(x=2.8, z=1.0))
+        
+        self.radar = self.world.spawn_actor(radar_bp, spawn_point, attach_to=self.vehicle)
+        self.radar.listen(self.process_radar)
+        print("Attached Radar sensor.")
+
+    def process_radar(self, data):
+        """Callback for radar sensor."""
+        try:
+            # data is a carla.RadarMeasurement
+            # Just push it to the queue
+            self.radar_queue.put(data)
+        except Exception as e:
+            print(f"Error in process_radar: {e}", flush=True)
+
+    def get_closest_radar_object(self, timeout=0.05):
+        """
+        Retrieves the latest radar packet and filters for the closest relevant object.
+        Filters:
+        - Azimuth within +/- 10 degrees (Focus on lane)
+        - Sort by Depth (Closest)
+        
+        Returns:
+            dict: {'depth': float, 'velocity': float, 'azimuth': float} or None
+        """
+        try:
+            # Get latest, flush old
+            last_data = None
+            while not self.radar_queue.empty():
+                try:
+                    last_data = self.radar_queue.get(timeout=timeout)
+                except Empty:
+                    break
+            
+            if last_data is None:
+                return None
+                
+            # Process detections
+            closest_det = None
+            min_depth = float('inf')
+            
+            # Thresholds
+            azimuth_limit = 0.20 # ~11 degrees (radians)
+            
+            for detect in last_data:
+                # detect has depth, azimuth, altitude, velocity
+                # Check Azimuth (Forward Cone)
+                if abs(detect.azimuth) > azimuth_limit:
+                    continue
+                    
+                if detect.depth < min_depth:
+                    min_depth = detect.depth
+                    closest_det = detect
+            
+            if closest_det:
+                return {
+                    'depth': closest_det.depth,
+                    'velocity': closest_det.velocity, # m/s
+                    'azimuth': closest_det.azimuth
+                }
+            return None
+            
+        except Exception as e:
+            print(f"Error in get_closest_radar_object: {e}", flush=True)
+            return None
+
     def get_frame(self, timeout=1.0):
         """Retrieve the latest frame from the queue."""
         try:
@@ -196,6 +277,11 @@ class CarlaInterface:
             try:
                 self.camera.stop()
                 self.camera.destroy()
+            except: pass
+        if self.radar:
+            try:
+                self.radar.stop()
+                self.radar.destroy()
             except: pass
         if self.vehicle:
             try:

@@ -57,6 +57,9 @@ class XAIModule:
                     cv2.rectangle(saliency_layer, (x1, y1), (x2, y2), (0, 0, 255), -1)
                     explanation = f"CRITICAL: {label} is {dist}m away, approaching at {speed}m/s. TTC {ttc}s < Threshold."
                     
+                    if det.get('radar_available'):
+                        explanation += f" [RADAR VERIFIED: Dist={det.get('radar_dist')}m]"
+                    
                     # Check if this is the most critical for control
                     # Prioritize GT
                     eff_ttc = det.get('gt_ttc', ttc)
@@ -78,6 +81,9 @@ class XAIModule:
                 
                 # Label
                 label_text = f"{label} {dist}m"
+                if det.get('radar_available'):
+                    label_text = f"{label} [R] {dist}m"
+                
                 if risk == 'Unsafe':
                     label_text += f" TTC:{ttc}s"
                     
@@ -102,6 +108,9 @@ class XAIModule:
                                     f"  - Distance: {c_dist}m\n" \
                                     f"  - TTC: {c_ttc}s\n" \
                                     f"  - Risk Assessment: {c_risk}"
+                                    
+                     if critical_det.get('radar_available'):
+                         control_exp += f"\n  - Sensor: RADAR FUSION (Dist: {critical_det.get('radar_dist')}m)"
                  elif latch_state:
                      control_exp += "\n  - Reason: Emergency Latch Active (Override)"
                      

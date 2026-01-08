@@ -103,15 +103,31 @@ class DecisionAgent:
                      elif det['risk'] == 'Unsafe': 
                          # Downgrade if GT says safe? Or keep it?
                          # "Use CARLA based ... to compute TTC ... Ensure that collision warnings are triggered consistently"
-                         # implies we should rely on GT.
                          det['risk'] = 'Safe'
-                         if overall_status == "Unsafe": 
-                             # Re-evaluate overall status? 
-                             # This is tricky without re-looping. 
-                             # But usually 'Unsafe' is set if ANY is unsafe.
-                             pass 
                 else:
                      det['gt_ttc'] = float('inf')
+
+            # Radar Analysis (Takes Precedence if Available)
+            if det.get('radar_available'):
+                # Radar Data Logic
+                r_dist = det.get('radar_dist', float('inf'))
+                r_ttc = det.get('radar_ttc', float('inf'))
+                
+                # Trust Radar TTC
+                det['ttc'] = r_ttc 
+                det['distance'] = r_dist # Ensure visualization uses radar distance
+                
+                if r_ttc < self.ttc_threshold:
+                    det['risk'] = 'Unsafe'
+                    overall_status = "Unsafe"
+                elif r_dist < 7.0: 
+                    # Physical proximity safety net
+                    det['risk'] = 'Unsafe' 
+                    overall_status = "Unsafe"
+                else:
+                    det['risk'] = 'Safe'
+                    # If previously 'Unsafe' due to vision? Overwrite.
+                    # Radar is usually better than monocular vision.
             
         self.prev_detections = detections
         return detections, overall_status

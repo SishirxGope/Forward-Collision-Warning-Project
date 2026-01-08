@@ -148,6 +148,7 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
         carla_interface.setup()
         carla_interface.setup_fcw_scenario()
         carla_interface.attach_camera()
+        carla_interface.attach_radar()
         
         # Wait for simulation to settle
         time.sleep(2)
@@ -201,22 +202,84 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
             # 1. Perception
             detections = perception.detect(frame)
             
-            # Ground Truth Injection (CARLA Specific)
-            # Ground Truth Injection (CARLA Specific - EXCLUSIVE SOURCE)
+            # Ground Truth Injection (Reference)
             gt = carla_interface.get_ground_truth()
+
+            # Radar Data & TTC Computation
+            radar_obj = carla_interface.get_closest_radar_object()
+            radar_dist = float('inf')
+            radar_speed = 0.0
+            radar_ttc = float('inf')
             
-            # Apply GT to detections (Disable Vision Estimation)
+            if radar_obj:
+                radar_dist = radar_obj['depth']
+                radar_speed = radar_obj['velocity'] # m/s (Negative = Closing)
+                
+                # Compute Radar TTC
+                # In CARLA Radar: Negative velocity means approaching?
+                # Actually, check CARLA docs or assumed convention. 
+                # Usually: relative_velocity = v_target - v_ego. 
+                # If target is slower (stopped), and we approach: v_target(0) - v_ego(10) = -10.
+                # So Negative is Closing.
+                if radar_speed < -0.1:
+                    radar_ttc = radar_dist / abs(radar_speed)
+                else:
+                    radar_ttc = float('inf')
+                    
+                print(f"[RADAR] Dist: {radar_dist:.2f}m | Vel: {radar_speed:.2f}m/s | TTC: {radar_ttc:.2f}s")
+            
+            # Apply Radar/GT to detections
             for det in detections:
-                # Default to infinite if no GT (or not the target)
+                # Default
                 det['distance'] = float('inf') 
                 det['speed'] = 0.0
+                det['ttc'] = float('inf')
                 
+                # Match Radar to object (Simplification: Assume radar hits the relevant object if detected)
+                if radar_obj and det['label'] in ['car', 'truck', 'bus']:
+                    # In a real system, we'd check azimuth match.
+                    # Here we assume single lead vehicle scenario.
+                    det['radar_available'] = True
+                    det['radar_dist'] = radar_dist
+                    det['radar_speed'] = radar_speed
+                    det['radar_ttc'] = radar_ttc
+                    
+                    # Force values for downstream agents
+                    det['distance'] = radar_dist
+                    det['speed'] = radar_speed # Relative
+                    det['ttc'] = radar_ttc
+                
+                # Optional: Keep GT for reference/logging if needed, but Radar is now 'Sensor' Truth
                 if gt and det['label'] in ['car', 'truck', 'bus']:
-                    det['ground_truth'] = gt
-                    # FORCE GT VALUES
-                    det['distance'] = gt['distance']
-                    # Use GT speed directly for robustness in simulation
-                    det['speed'] = gt['speed'] 
+                     det['ground_truth'] = gt 
+                     det['gt_dist'] = gt['distance']
+                     det['gt_speed'] = gt['speed'] 
+            
+            # --- Ghost Object Creation (Sensor Fusion Robustness) ---
+            # If we have a Radar object but NO vision detections linked to it?
+            # This happens if YOLO misses the car (e.g. too close/occluded).
+            # We MUST act on the Radar data.
+            radar_claimed = False
+            for det in detections:
+                if det.get('radar_available'):
+                    radar_claimed = True
+                    break
+            
+            if radar_obj and not radar_claimed:
+                print(f"[FUSION] Radar Object detected but not visually matched. Creating Ghost Object at {radar_dist}m.")
+                ghost_det = {
+                    'label': 'obstacle (radar)',
+                    'box': [0, 0, frame.shape[1], frame.shape[0]], # Full screen or generic box
+                    'confidence': 1.0,
+                    'distance': radar_dist,
+                    'speed': radar_speed,
+                    'ttc': radar_ttc,
+                    'radar_available': True,
+                    'radar_dist': radar_dist,
+                    'radar_speed': radar_speed,
+                    'radar_ttc': radar_ttc
+                }
+                detections.append(ghost_det) 
 
 
             # 2. Distance Estimation (Vision Based) - DISABLED per user request
