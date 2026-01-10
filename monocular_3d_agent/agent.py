@@ -58,6 +58,97 @@ class Monocular3DBoxAgent:
         
         return (X, Y, Z)
 
+    def project_points(self, points_3d, image_shape, ego_transform=None, focal_length=None):
+        """
+        Projects a list of 3D points (global frame) onto the 2D image plane.
+        
+        Args:
+            points_3d (list): List of (x,y,z) or (x,y) tuples in GLOBAL frame.
+            image_shape (tuple): (height, width).
+            ego_transform (dict): Current ego pose {'x', 'y', 'z', 'yaw'} for coordinate transform.
+                                  REQUIRED if points are global.
+        
+        Returns:
+            list: List of (u, v) pixel coordinates.
+        """
+        if not points_3d or not ego_transform:
+            return []
+            
+        fl = focal_length if focal_length is not None else self.focal_length
+        h_img, w_img = image_shape[:2]
+        cx, cy = w_img / 2.0, h_img / 2.0
+        
+        points_2d = []
+        
+        # Ego Transform Inverse (Global -> Local)
+        # 1. Translate
+        # 2. Rotate
+        
+        ex, ey, ez = ego_transform['x'], ego_transform['y'], ego_transform['z']
+        yaw = ego_transform['yaw']
+        
+        cos_yaw = np.cos(yaw)
+        sin_yaw = np.sin(yaw)
+        
+        for pt in points_3d:
+            gx, gy = pt[0], pt[1]
+            gz = pt[2] if len(pt) > 2 else 0.0 # Z is usually road level? 
+            # In CARLA, Z=0 is often ground, but camera is at Z=1.5. 
+            # We need point relative to Camera.
+            
+            # Step 1: Translate to Ego Origin (at ground)
+            dx = gx - ex
+            dy = gy - ey
+            dz_world = gz - ez # relative Z? 
+            
+            # Step 2: Rotate to Ego Forward (Local X is Forward)
+            # Global X, Y to Local X, Y
+            # Rot Matrix R = [cos  -sin]
+            #                [sin   cos]
+            # Inverse R = R.T
+            # lx = dx * cos + dy * sin
+            # ly = -dx * sin + dy * cos
+            
+            lx = dx * cos_yaw + dy * sin_yaw
+            ly = -dx * sin_yaw + dy * cos_yaw
+            lz = dz_world
+            
+            # Step 3: Camera Transform
+            # Camera is at (1.5, 0, 2.4) relative to Ego? 
+            # Let's assume camera is at x=1.5, z=2.4 (from interface.py attach_camera)
+            cam_x_offset = 1.5
+            cam_z_offset = 2.4
+            
+            # Point in Camera Coordinates:
+            # Camera Forward is X, Camera Right is Y, Camera Down is Z? 
+            # Standard Computer Vision: Z-forward, X-right, Y-down.
+            # CARLA UE4: X-forward, Y-right, Z-up.
+            
+            # Let's convert Ego-Local (UE4) to Camera-Local (CV).
+            
+            # UE4 Point relative to Camera position
+            ue_x = lx - cam_x_offset
+            ue_y = ly # Camera is centered laterally
+            ue_z = lz - cam_z_offset # Object is usually below camera (ground)
+            
+            # CV Frame:
+            # Z_cv = UE_X (Forward)
+            # X_cv = UE_Y (Right)
+            # Y_cv = -UE_Z (Down is positive Y in image)
+            
+            Z_cv = ue_x
+            X_cv = ue_y
+            Y_cv = -ue_z
+            
+            if Z_cv <= 0.1: continue # Behind camera
+            
+            u = (X_cv * fl) / Z_cv + cx
+            v = (Y_cv * fl) / Z_cv + cy
+            
+            points_2d.append((int(u), int(v)))
+            
+        return points_2d
+
     def compute_3d_box(self, detection, image_shape, focal_length=None):
         """
         Compute the 8 corners of the 3D bounding box projected onto the image.

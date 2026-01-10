@@ -12,9 +12,9 @@ from carla_interface.interface import CarlaInterface
 import argparse
 import sys
 import datetime
-import datetime
 import time
 import math
+import numpy as np
 
 def main():
     """
@@ -185,7 +185,7 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
                 continue
             
             # [DEBUG] Trace frame
-            # print(f"[DEBUG] Processing frame {frame_idx}", flush=True)
+
 
             # Initialize VideoWriter if not already done
             if out is None:
@@ -259,14 +259,17 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
             # If we have a Radar object but NO vision detections linked to it?
             # This happens if YOLO misses the car (e.g. too close/occluded).
             # We MUST act on the Radar data.
+            # ADJUSTMENT: Add Warmup to prevent false positives at start
+            warmup_frames = 20 # Skip first 1-2 seconds
+            
             radar_claimed = False
             for det in detections:
                 if det.get('radar_available'):
                     radar_claimed = True
                     break
             
-            if radar_obj and not radar_claimed:
-                print(f"[FUSION] Radar Object detected but not visually matched. Creating Ghost Object at {radar_dist}m.")
+            if radar_obj and not radar_claimed and frame_idx > warmup_frames:
+                print(f"[FUSION] Radar Object detected but not visually matched. Creating Ghost Object at {radar_dist:.2f}m.")
                 ghost_det = {
                     'label': 'obstacle (radar)',
                     'box': [0, 0, frame.shape[1], frame.shape[0]], # Full screen or generic box
@@ -282,8 +285,7 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
                 detections.append(ghost_det) 
 
 
-            # 2. Distance Estimation (Vision Based) - DISABLED per user request
-            # detections = distance_estimator.estimate(detections, frame.shape[1])
+
             
             # 3. Decision
             detections, overall_status = decision_maker.analyze(detections)
@@ -293,9 +295,17 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
             
             # 5. Collision Avoidance
             ego_speed = carla_interface.get_ego_speed()
-            action = collision_avoider.get_control_action(detections, overall_status, ego_speed)
-            if action != "Maintain Speed":
-                print(f"  [CONTROL] {action}")
+            ego_pose = carla_interface.get_ego_transform()
+            carla_map = carla_interface.get_map()
+            
+            action = collision_avoider.get_control_action(detections, overall_status, ego_speed, ego_pose, carla_map)
+            
+            action_str = action
+            if isinstance(action, dict):
+                 action_str = "Avoidance Maneuver" # Simplified string for logging
+            
+            if action_str != "Maintain Speed":
+                print(f"  [CONTROL] {action_str}")
             
             # Apply Control to CARLA
             carla_interface.apply_control(action)
@@ -307,13 +317,47 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
             if action == "Apply Full Braking" and ego_speed < 0.1 and not stop_snapshot_saved:
                 print("  [EVENT] Ego Vehicle Stopped. Saving Explanation.")
                 # Force an explanation generation if not already done
-                annotated_frame, explanation = explainer.explain(frame, detections, alert_msg, action, ego_speed, collision_avoider.emergency_latch)
+                annotated_frame, explanation = explainer.explain(frame, detections, alert_msg, action_str, ego_speed, collision_avoider.emergency_latch)
                 _save_alert_snapshot(annotated_frame, explanation, "EMERGENCY STOP EXECUTED", output_path)
                 stop_snapshot_saved = True
 
+            # Visualization of Avoidance Path
+            # Check debug info from agent first (covers both active and rejected paths)
+            debug_path = getattr(collision_avoider, 'debug_path', None)
+            path_valid = getattr(collision_avoider, 'path_valid', False)
+            
+            # Fallback to action path if active
+            if not debug_path and isinstance(action, dict):
+                debug_path = action.get('path')
+                path_valid = True
+
+            if debug_path:
+                color = (0, 255, 0) if path_valid else (0, 0, 255) # Green if valid, Red if rejected
+                points_2d = monocular_3d.project_points(debug_path, frame.shape, ego_pose, f_carla)
+                if points_2d:
+                    pts = np.array(points_2d, dtype=np.int32)
+                    cv2.polylines(annotated_frame, [pts], False, color, 2)
+                    # Label curvature
+                    if isinstance(action, dict): 
+                        curv = action.get('curvature', 0.0)
+                        cv2.putText(annotated_frame, f"Curv: {curv:.3f}", (points_2d[0][0], points_2d[0][1] - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    if not path_valid:
+                         cv2.putText(annotated_frame, "INVALID PATH", (points_2d[0][0], points_2d[0][1] - 30), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
             if alert_msg:
                 print(f"  [ALERT] {alert_msg}")
-                _log_carla_event(detections, output_path, action, collision_avoider.emergency_latch)
+                # construct log info
+                log_info = {
+                    'action': action_str,
+                    'latch': collision_avoider.emergency_latch,
+                }
+                if isinstance(action, dict):
+                     log_info['side'] = action.get('side', 'N/A')
+                     log_info['curvature'] = action.get('curvature', 0.0)
+                     
+                _log_carla_event(detections, output_path, log_info)
             
             # 3D Box Estimation
             for det in detections:
@@ -321,7 +365,7 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
                 det['center_3d'] = monocular_3d.compute_3d_center(det, frame.shape, focal_length=f_carla)
 
             # 6. XAI
-            annotated_frame, explanation = explainer.explain(frame, detections, alert_msg, action, ego_speed, collision_avoider.emergency_latch)
+            annotated_frame, explanation = explainer.explain(frame, detections, alert_msg, action_str, ego_speed, collision_avoider.emergency_latch)
 
             if alert_msg:
                 _save_alert_snapshot(annotated_frame, explanation, alert_msg, output_path)
@@ -333,7 +377,6 @@ def run_carla_mode(perception, distance_estimator, monocular_3d, decision_maker,
             
             if frame_idx % 10 == 0:
                 if out and out.isOpened():
-                    # print(f"[DEBUG] Writing frame {frame_idx}", flush=True)
                     pass
                 else:
                     print(f"[ERROR] VideoWriter not ready at frame {frame_idx}", flush=True)
@@ -408,14 +451,20 @@ def run_video_mode(video_path, perception, distance_estimator, monocular_3d, dec
     out.release()
     print("Video processing complete.")
 
-def _log_carla_event(detections, output_path, action="Maintain Speed", latch_state=False):
+def _log_carla_event(detections, output_path, log_info):
     """Helper to log CARLA events to CSV."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Parse log info
+    action = log_info.get('action', 'Maintain Speed')
+    latch_state = log_info.get('latch', False)
+    side = log_info.get('side', 'N/A')
+    curvature = log_info.get('curvature', 0.0)
     
     # Determine Brake Intensity
     brake_intensity = 0.0
     if action == "Apply Braking":
-        brake_intensity = 0.5
+        brake_intensity = 1.0
     elif action == "Apply Full Braking":
         brake_intensity = 1.0
         
@@ -429,12 +478,15 @@ def _log_carla_event(detections, output_path, action="Maintain Speed", latch_sta
              gt_speed = det.get('gt_speed', -1)
              gt_ttc = det.get('gt_ttc', -1)
              
-             log_line = f"{timestamp},{dist},{speed},{ttc},{gt_dist},{gt_speed},{gt_ttc},{action},{brake_intensity},{latch_state}\n"
+             # CSV Columns: 
+             # Timestamp,Distance,Speed,TTC,GT_Distance,GT_Speed,GT_TTC,Action,Brake_Intensity,Latch_Active,Side,Curvature
+             
+             log_line = f"{timestamp},{dist},{speed},{ttc},{gt_dist},{gt_speed},{gt_ttc},{action},{brake_intensity},{latch_state},{side},{curvature}\n"
              
              csv_path = os.path.join(output_path, "carla_events.csv")
              if not os.path.exists(csv_path):
                  with open(csv_path, 'w') as f:
-                     f.write("Timestamp,Distance,Speed,TTC,GT_Distance,GT_Speed,GT_TTC,Action,Brake_Intensity,Latch_Active\n")
+                     f.write("Timestamp,Distance,Speed,TTC,GT_Distance,GT_Speed,GT_TTC,Action,Brake_Intensity,Latch_Active,Side,Curvature\n")
              
              with open(csv_path, 'a') as f:
                  f.write(log_line)

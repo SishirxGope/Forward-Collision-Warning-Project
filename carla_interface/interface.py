@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 from queue import Queue
 from queue import Empty
+import math
 
 class CarlaInterface:
     def __init__(self, host='localhost', port=2000):
@@ -43,6 +44,10 @@ class CarlaInterface:
         except Exception as e:
             print(f"Error connecting to CARLA: {e}")
             raise
+
+    def get_map(self):
+        """Returns the CARLA map object."""
+        return self.world.get_map() if self.world else None
 
     def setup_fcw_scenario(self, ego_filter='vehicle.tesla.model3', lead_filter='vehicle.nissan.patrol', lead_distance=20.0):
         """
@@ -243,6 +248,12 @@ class CarlaInterface:
             
             for detect in last_data:
                 # detect has depth, azimuth, altitude, velocity
+                
+                # Filter noise/self-detection
+                if detect.depth < 2.5:
+                    continue
+                    
+                # Azimuth check (FOV constraint)
                 # Check Azimuth (Forward Cone)
                 if abs(detect.azimuth) > azimuth_limit:
                     continue
@@ -340,7 +351,9 @@ class CarlaInterface:
         Disables autopilot if intervention is needed.
         
         Args:
-            action (str): One of ['Maintain Speed', 'Warning Only', 'Apply Braking', 'Apply Full Braking']
+            action (str or dict): Control action.
+                                  Str: 'Maintain Speed', ...
+                                  Dict: {'steer': float, 'throttle': float, 'brake': float, 'path': list}
         """
         if not self.vehicle:
             return
@@ -355,33 +368,67 @@ class CarlaInterface:
         try:
             self.vehicle.set_autopilot(False, self.tm_port)
         except Exception:
-            pass # Ignore TM errors, control override will handle it
+            pass # Ignore TM errors
 
-        if action == "Maintain Speed" or action == "Warning Only":
+        # 1. Handle Dictionary Action (Trajectory Following)
+        if isinstance(action, dict):
+             control.steer = action.get('steer', 0.0)
+             control.throttle = action.get('throttle', 0.0)
+             control.brake = action.get('brake', 0.0)
+             
+             # Draw Path if available
+             if 'path' in action and action['path']:
+                 self.draw_path(action['path'])
+                 
+             print(f"[CONTROL] Trajectory: Steer={control.steer:.2f} Throttle={control.throttle:.2f} Brake={control.brake:.2f}", flush=True)
+
+        # 2. Handle String Action (Legacy / Simple)
+        elif action == "Maintain Speed" or action == "Warning Only":
             # Apply constant low throttle to move forward (Initial Motion)
             control.throttle = 0.3 
             control.brake = 0.0
             
         elif action == "Apply Braking":
             control.throttle = 0.0
-            control.brake = 1.0 # Increased from 0.5 to 1.0 for stronger response
+            control.brake = 1.0 
             
         elif action == "Apply Full Braking":
-            # Should be covered by latch, but for completeness
             control.throttle = 0.0
-            control.brake = 1.0 # Full emergency braking
-            control.hand_brake = True # Force stop
+            control.brake = 1.0 
+            control.hand_brake = True 
             
         else:
             # Fallback
             control.throttle = 0.0
             control.brake = 0.0
-
-            control.brake = 0.0
             
-        print(f"[DEBUG] Applying Control: {action} | Throttle: {control.throttle} | Brake: {control.brake} | Handbrake: {control.hand_brake}", flush=True)
+        # print(f"[DEBUG] Applying Control: {action} | Throttle: {control.throttle} | Brake: {control.brake} | Handbrake: {control.hand_brake}", flush=True)
 
         self.vehicle.apply_control(control)
+
+    def get_ego_transform(self):
+        """Returns the current transform (pose) of the ego vehicle."""
+        if not self.vehicle:
+            return None
+        t = self.vehicle.get_transform()
+        # Convert to simple dict
+        return {
+            'x': t.location.x,
+            'y': t.location.y,
+            'z': t.location.z,
+            'yaw': math.radians(t.rotation.yaw)
+        }
+        
+    def draw_path(self, path, life_time=0.1):
+        """Draws the path in the CARLA world."""
+        if not self.world: return
+        
+        # path is list of (x,y)
+        for i in range(len(path)-1):
+            p0 = carla.Location(x=path[i][0], y=path[i][1], z=1.5)
+            p1 = carla.Location(x=path[i+1][0], y=path[i+1][1], z=1.5)
+            self.world.debug.draw_line(p0, p1, thickness=0.1, color=carla.Color(0, 255, 0), life_time=life_time)
+
 
     def get_ego_speed(self):
         """Returns the current speed of the ego vehicle in m/s."""
