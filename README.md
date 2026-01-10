@@ -63,20 +63,28 @@ The system now integrates a Radar sensor within CARLA to enhance reliability:
 *   **Sensor Fusion**: Fuses Visual detections with Radar depth and velocity data. It ensures obstacles are tracked even if visual occlusion occurs ("Ghost Objects").
 *   **Visualization**: The `gui.py` interface renders a top-down Radar Map, scaling obstacles based on their real-time distance and ensuring they are visually distinct from the ego vehicle icon.
 
-## Collision Avoidance Extension (Automatic Braking)
-To move beyond passive warnings, the system has been extended with a **Collision Avoidance Agent** capable of active vehicle control within the CARLA simulation environment. This module transforms the system from a passive ADAS (Advanced Driver Assistance System) to an active safety system.
+## Trajectory-Based Collision Avoidance
+The system has been upgraded from simple automatic braking to a sophisticated **Trajectory-Based Avoidance System**. It actively steers the vehicle to bypass obstacles when braking alone is insufficient or inefficient.
 
-### Control Logic
-The agent operates on a deterministic, tiered logic based on Time-To-Collision (TTC) thresholds, strictly separating warning generation from control intervention:
-*   **Warning (1.5s < TTC ≤ 2.5s)**: The system issues a textual and visual alert but maintains vehicle speed (`Warning Only`).
-*   **Critical Braking (0.8s < TTC ≤ 1.5s)**: The system disables autopilot and applies moderate braking (50% intensity) to mitigate collision risk.
-*   **Emergency Braking (TTC ≤ 0.8s)**: The system applies full braking (100% intensity) to execute an emergency stop.
-*   **Proximity Safety Curtain**:
-    *   **Emergency (< 7m)**: Immediate full braking is triggered if the lead vehicle is within 7 meters, overriding TTC to prevent point-blank collisions.
-    *   **Precautionary (< 12m)**: Minimum braking is applied if closing in within 12 meters, ensuring safety even if relative speed (and thus TTC) seems momentarily safe.
-*   **Terminal STOP State**: Once the vehicle comes to a complete halt following an emergency intervention, it enters a `STOP` state (Handbrake logic). The vehicle remains stationary until manually reset, ensuring it does not creep forward after avoiding a collision.
+### 1. Adaptive Path Planning
+*   **B-Spline Trajectories**: Generates smooth, drivable paths using localized cubic B-splines.
+*   **Adaptive Offset Search**: The planner intelligently searches for a safe lateral offset (starting at 4.0m and iteratively reducing if constrained) to find a valid passing lane.
+*   **Dynamic Optimal Side Selection**: The agent evaluates both **Left** and **Right** avoidance options simultaneously. It automatically selects the optimal side based on:
+    *   **Validity**: Is the path free of collisions?
+    *   **Lane Type**: Prefers `Driving` lanes over `Shoulders`.
+    *   **Safety**: Picks the side with the widest safe clearance.
+
+### 2. Strict Road Containment
+Safety is enforced through rigorous map-based validation:
+*   **Zero Tolerance**: The planner strictly forbids any path that clips a **Sidewalk** or goes off-road.
+*   **Shoulder Usage**: On narrow single-lane roads, the system is intelligent enough to utilize the **Shoulder** for avoidance if (and only if) it is the only safe way to pass without hitting a sidewalk.
+
+### 3. Control & Execution
+*   **Pure Pursuit Controller**: A geometric controller tracks the generated B-spline path with high precision.
+*   **Emergency Brake Fallback**:If the road is too narrow to pass safely (e.g., blocked by walls/sidewalks on both sides), the system correctly identifies the impossibility of avoidance and falls back to **Emergency Braking** to prevent a crash.
+*   **Terminal STOP State**: Once the vehicle comes to a complete halt following an emergency intervention, it enters a `STOP` state (Handbrake logic) until manually reset.
 
 ### Integration & Verification
-*   **CARLA Control API**: The agent interfaces directly with the CARLA vehicle control API, overriding the autopilot during critical events to apply longitudinal control (throttle/brake). Use `python main.py --source carla` to activate this mode.
-*   **Explainable Actions**: The **XAI Module** now explains control decisions, detailing the specific action taken (e.g., "ACTION: Apply Full Braking") and the reasoning (TTC, Distance) alongside the visual alert.
-*   **Event Logging**: All avoidance actions are logged to `outputs/carla_events.csv`, capturing the applied brake intensity, TTC, and vehicle states for post-simulation verification of collision prevention.
+*   **CARLA Control API**: The agent interfaces directly with the CARLA vehicle control API, overriding the autopilot during critical events. Use `python main.py --source carla` to activate this mode.
+*   **Explainable Actions**: The **XAI Module** explains decisions, detailing the specific action (e.g., "ACTION: Avoidance Maneuver (Left)") and reasoning.
+*   **Event Logging**: All avoidance actions are logged to `outputs/carla_events.csv`.
